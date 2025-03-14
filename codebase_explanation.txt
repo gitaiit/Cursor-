@@ -1,0 +1,24 @@
+What is a Codebase?
+
+A codebase is the complete collection of source code used to build a particular software application or project. It includes:
+
+1. All source code files
+2. Configuration files
+3. Documentation
+4. Build scripts
+5. Test files
+6. Resource files
+
+Key characteristics of a codebase:
+- It's typically stored in a version control system (like Git)
+- It contains all the code needed to build and run the application
+- It may include multiple programming languages
+- It evolves over time as developers make changes
+- It serves as the single source of truth for the project
+
+A well-organized codebase is essential for:
+- Collaboration between developers
+- Maintaining software quality
+- Making updates and improvements
+- Debugging issues
+- Onboarding new team members 
