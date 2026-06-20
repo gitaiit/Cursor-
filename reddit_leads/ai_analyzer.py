@@ -2,7 +2,7 @@ import os
 import json
 import time
 
-import anthropic
+import google.generativeai as genai
 
 
 SYSTEM_PROMPT = """You are a lead qualification specialist for The Admit Co., an MBA and GMAT admissions consulting firm. Analyze Reddit posts, comments, and DMs to identify prospective clients who may benefit from admissions consulting.
@@ -42,17 +42,27 @@ intent_level must match lead_score: 7-10 = High, 4-6 = Medium, 1-3 = Low.
 Return ONLY the JSON array."""
 
 
+# Short content that contains these words is kept despite being under 30 chars
+_HIGH_INTENT_OVERRIDES = {"dm", "message", "consult", "help", "hire", "recommend", "worth it"}
+
+
 def _should_skip(item: dict) -> bool:
     content = item.get("content", "").strip()
     username = item.get("username", "")
 
-    if len(content) < 30:
-        return True
+    # Bot accounts
     if username.lower().endswith("bot") or username == "AutoModerator":
         return True
-    # Link-only: content is just a URL
+
+    # Link-only posts
     if content.startswith("http") and " " not in content:
         return True
+
+    # Short content — keep if it contains a high-intent word, drop otherwise
+    if len(content) < 30:
+        content_lower = content.lower()
+        if not any(word in content_lower for word in _HIGH_INTENT_OVERRIDES):
+            return True
 
     return False
 
@@ -94,37 +104,43 @@ def _empty_analysis(index: int) -> dict:
     }
 
 
-def analyze_batch(client: anthropic.Anthropic, items: list[dict], model: str) -> list[dict]:
-    prompt = _build_prompt(items)
+def _parse_response(raw: str) -> list[dict]:
+    # Strip markdown code fences if Gemini wraps the output
+    text = raw.strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[-1]
+        text = text.rsplit("```", 1)[0]
+    return json.loads(text.strip())
+
+
+def analyze_batch(model, items: list[dict]) -> list[dict]:
+    full_prompt = SYSTEM_PROMPT + "\n\n" + _build_prompt(items)
 
     for attempt in range(3):
         try:
-            response = client.messages.create(
-                model=model,
-                max_tokens=2000,
-                system=SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            raw = response.content[0].text.strip()
-            analyses = json.loads(raw)
+            response = model.generate_content(full_prompt)
+            raw = response.text
+            analyses = _parse_response(raw)
             if len(analyses) != len(items):
                 raise ValueError(f"Expected {len(items)} results, got {len(analyses)}")
             return analyses
 
-        except anthropic.RateLimitError:
-            wait = 60 * (attempt + 1)
-            print(f"  [WARN] Rate limit hit, waiting {wait}s...")
-            time.sleep(wait)
+        except Exception as e:
+            err = str(e)
+            is_rate_limit = "429" in err or "quota" in err.lower() or "rate" in err.lower()
 
-        except anthropic.APIStatusError as e:
-            print(f"  [WARN] API error ({e.status_code}), attempt {attempt + 1}/3")
-            time.sleep(10)
-
-        except (json.JSONDecodeError, ValueError) as e:
-            print(f"  [WARN] Parse error on attempt {attempt + 1}/3: {e}")
-            if attempt == 2:
-                return [_empty_analysis(i + 1) for i in range(len(items))]
-            time.sleep(2)
+            if is_rate_limit:
+                wait = 60 * (attempt + 1)
+                print(f"  [WARN] Rate limit hit, waiting {wait}s...")
+                time.sleep(wait)
+            elif isinstance(e, (json.JSONDecodeError, ValueError)):
+                print(f"  [WARN] Parse error on attempt {attempt + 1}/3: {e}")
+                if attempt == 2:
+                    return [_empty_analysis(i + 1) for i in range(len(items))]
+                time.sleep(2)
+            else:
+                print(f"  [WARN] API error on attempt {attempt + 1}/3: {e}")
+                time.sleep(10)
 
     return [_empty_analysis(i + 1) for i in range(len(items))]
 
@@ -132,24 +148,25 @@ def analyze_batch(client: anthropic.Anthropic, items: list[dict], model: str) ->
 def analyze_all_items(
     items: list[dict],
     batch_size: int = 5,
-    model: str = "claude-sonnet-4-6",
+    gemini_model: str = "gemini-1.5-flash",
 ) -> list[dict]:
-    api_key = os.getenv("ANTHROPIC_API_KEY")
+    api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
-        raise ValueError("ANTHROPIC_API_KEY must be set in .env")
-    client = anthropic.Anthropic(api_key=api_key)
+        raise ValueError("GEMINI_API_KEY must be set in .env")
 
-    # Pre-filter cheap noise before hitting the API
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel(gemini_model)
+
+    # Pre-filter noise before hitting the API
     filtered_items, dropped = prefilter(items)
     print(f"  Pre-filter: kept {len(filtered_items)}, dropped {dropped} low-signal items")
 
-    # Batch and analyze
     enriched = []
     batches = [filtered_items[i:i + batch_size] for i in range(0, len(filtered_items), batch_size)]
 
     for batch_num, batch in enumerate(batches, 1):
         print(f"  Analyzing batch {batch_num}/{len(batches)} ({len(batch)} items)...")
-        analyses = analyze_batch(client, batch, model)
+        analyses = analyze_batch(model, batch)
 
         for item, analysis in zip(batch, analyses):
             enriched.append({**item, **analysis})

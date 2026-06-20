@@ -2,10 +2,11 @@
 Test script for the AI analyzer module.
 Run: python test_analyzer.py
 
-Uses a small set of fake Reddit items so you can verify Claude scoring
+Uses a small set of fake Reddit items so you can verify Gemini scoring
 without needing live Reddit credentials.
 
-Required in .env: ANTHROPIC_API_KEY
+Required in .env: GEMINI_API_KEY
+Get a free key at: https://aistudio.google.com/app/apikey
 """
 from dotenv import load_dotenv
 from reddit_leads.ai_analyzer import analyze_all_items
