@@ -1,6 +1,5 @@
 import os
 import time
-import json
 from datetime import datetime, timezone
 
 import praw
@@ -11,15 +10,23 @@ def get_reddit_client() -> praw.Reddit:
     client_id = os.getenv("REDDIT_CLIENT_ID")
     client_secret = os.getenv("REDDIT_CLIENT_SECRET")
     user_agent = os.getenv("REDDIT_USER_AGENT", "admit_co_bot/1.0")
+    username = os.getenv("REDDIT_USERNAME")
+    password = os.getenv("REDDIT_PASSWORD")
 
     if not client_id or not client_secret:
         raise ValueError("REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET must be set in .env")
 
-    return praw.Reddit(
+    kwargs = dict(
         client_id=client_id,
         client_secret=client_secret,
         user_agent=user_agent,
     )
+    # Username + password required to read inbox/DMs
+    if username and password:
+        kwargs["username"] = username
+        kwargs["password"] = password
+
+    return praw.Reddit(**kwargs)
 
 
 def _item_from_post(post) -> dict | None:
@@ -90,6 +97,43 @@ def fetch_subreddit_items(
     return items
 
 
+def fetch_inbox_dms(
+    reddit: praw.Reddit,
+    processed_ids: set,
+    limit: int = 100,
+) -> list[dict]:
+    """
+    Fetches private messages (DMs) from the authenticated account's inbox.
+    Requires REDDIT_USERNAME and REDDIT_PASSWORD to be set in .env.
+    Returns items with type="dm".
+    """
+    items = []
+    try:
+        for message in reddit.inbox.messages(limit=limit):
+            item_id = f"dm_{message.id}"
+            if item_id in processed_ids:
+                continue
+            if message.author is None:
+                continue
+            items.append({
+                "id": item_id,
+                "type": "dm",
+                "username": str(message.author),
+                "subreddit": "DM",
+                "post_title": message.subject or "(no subject)",
+                "content": message.body[:2000],
+                "url": f"https://www.reddit.com/message/messages/{message.id}",
+                "timestamp": datetime.fromtimestamp(message.created_utc, tz=timezone.utc).isoformat(),
+                "parent_title": None,
+            })
+    except prawcore.exceptions.OAuthException:
+        print("  [WARN] Cannot read inbox: REDDIT_USERNAME/REDDIT_PASSWORD not set or invalid.")
+    except prawcore.exceptions.RequestException as e:
+        print(f"  [WARN] Could not fetch inbox DMs: {e}")
+
+    return items
+
+
 def collect_all_items(
     reddit: praw.Reddit,
     subreddits: list[str],
@@ -107,7 +151,16 @@ def collect_all_items(
                 seen_ids.add(item["id"])
                 all_items.append(item)
         print(f"  -> {len(items)} new items from r/{subreddit_name}")
-        time.sleep(1)  # be polite between subreddit requests
+        time.sleep(1)
+
+    # Fetch inbox DMs (requires REDDIT_USERNAME + REDDIT_PASSWORD in .env)
+    print("  Fetching inbox DMs...")
+    dm_items = fetch_inbox_dms(reddit, processed_ids)
+    for item in dm_items:
+        if item["id"] not in seen_ids:
+            seen_ids.add(item["id"])
+            all_items.append(item)
+    print(f"  -> {len(dm_items)} new DMs")
 
     all_items.sort(key=lambda x: x["timestamp"], reverse=True)
     return all_items
