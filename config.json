@@ -1,0 +1,10 @@
+{
+  "subreddits": [
+    "GMAT",
+    "MBA",
+    "gradadmissions"
+  ],
+  "posts_per_subreddit": 50,
+  "min_lead_score": 4,
+  "batch_size": 5
+}
