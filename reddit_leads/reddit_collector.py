@@ -1,68 +1,82 @@
-import os
 import time
 from datetime import datetime, timezone
 
-import praw
-import prawcore
+import requests
 
 
-def get_reddit_client() -> praw.Reddit:
-    client_id = os.getenv("REDDIT_CLIENT_ID")
-    client_secret = os.getenv("REDDIT_CLIENT_SECRET")
-    user_agent = os.getenv("REDDIT_USER_AGENT", "admit_co_bot/1.0")
-    username = os.getenv("REDDIT_USERNAME")
-    password = os.getenv("REDDIT_PASSWORD")
-
-    if not client_id or not client_secret:
-        raise ValueError("REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET must be set in .env")
-
-    kwargs = dict(
-        client_id=client_id,
-        client_secret=client_secret,
-        user_agent=user_agent,
-    )
-    # Username + password required to read inbox/DMs
-    if username and password:
-        kwargs["username"] = username
-        kwargs["password"] = password
-
-    return praw.Reddit(**kwargs)
+HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; admit_co_bot/1.0)"}
 
 
-def _item_from_post(post) -> dict | None:
-    if post.author is None or post.selftext in ("[removed]", "[deleted]", ""):
+def _fetch_json(url: str, retries: int = 3) -> dict | None:
+    for attempt in range(retries):
+        try:
+            response = requests.get(url, headers=HEADERS, timeout=10)
+            if response.status_code == 429:
+                wait = 60 * (attempt + 1)
+                print(f"  [WARN] Rate limited, waiting {wait}s...")
+                time.sleep(wait)
+                continue
+            if response.status_code != 200:
+                print(f"  [WARN] HTTP {response.status_code} for {url}")
+                return None
+            return response.json()
+        except requests.RequestException as e:
+            print(f"  [WARN] Request error (attempt {attempt + 1}/3): {e}")
+            time.sleep(5)
+    return None
+
+
+def _item_from_post(post: dict, subreddit: str) -> dict | None:
+    data = post.get("data", {})
+    if data.get("selftext") in ("", "[removed]", "[deleted]") or not data.get("author"):
         return None
     return {
-        "id": f"post_{post.id}",
+        "id": f"post_{data['id']}",
         "type": "post",
-        "username": str(post.author),
-        "subreddit": str(post.subreddit),
-        "post_title": post.title,
-        "content": post.selftext[:2000],
-        "url": f"https://www.reddit.com{post.permalink}",
-        "timestamp": datetime.fromtimestamp(post.created_utc, tz=timezone.utc).isoformat(),
+        "username": data["author"],
+        "subreddit": subreddit,
+        "post_title": data.get("title", ""),
+        "content": data.get("selftext", "")[:2000],
+        "url": f"https://www.reddit.com{data['permalink']}",
+        "timestamp": datetime.fromtimestamp(data["created_utc"], tz=timezone.utc).isoformat(),
         "parent_title": None,
     }
 
 
-def _item_from_comment(comment, post_title: str) -> dict | None:
-    if comment.author is None or comment.body in ("[removed]", "[deleted]"):
+def _item_from_comment(comment: dict, post_title: str, subreddit: str) -> dict | None:
+    data = comment.get("data", {})
+    if data.get("body") in ("[removed]", "[deleted]") or not data.get("author"):
         return None
     return {
-        "id": f"comment_{comment.id}",
+        "id": f"comment_{data['id']}",
         "type": "comment",
-        "username": str(comment.author),
-        "subreddit": str(comment.subreddit),
+        "username": data["author"],
+        "subreddit": subreddit,
         "post_title": post_title,
-        "content": comment.body[:2000],
-        "url": f"https://www.reddit.com{comment.permalink}",
-        "timestamp": datetime.fromtimestamp(comment.created_utc, tz=timezone.utc).isoformat(),
+        "content": data.get("body", "")[:2000],
+        "url": f"https://www.reddit.com{data['permalink']}",
+        "timestamp": datetime.fromtimestamp(data["created_utc"], tz=timezone.utc).isoformat(),
         "parent_title": post_title,
     }
 
 
+def _extract_comments(comment_list: list, post_title: str, subreddit: str) -> list[dict]:
+    items = []
+    for comment in comment_list:
+        if comment.get("kind") != "t1":
+            continue
+        item = _item_from_comment(comment, post_title, subreddit)
+        if item:
+            items.append(item)
+        # Recurse into replies
+        replies = comment.get("data", {}).get("replies", "")
+        if isinstance(replies, dict):
+            children = replies.get("data", {}).get("children", [])
+            items.extend(_extract_comments(children, post_title, subreddit))
+    return items
+
+
 def fetch_subreddit_items(
-    reddit: praw.Reddit,
     subreddit_name: str,
     post_limit: int = 50,
     processed_ids: set = None,
@@ -71,71 +85,52 @@ def fetch_subreddit_items(
         processed_ids = set()
 
     items = []
-    try:
-        subreddit = reddit.subreddit(subreddit_name)
-        posts = list(subreddit.new(limit=post_limit))
-    except prawcore.exceptions.RequestException as e:
-        print(f"  [WARN] Could not fetch r/{subreddit_name}: {e}")
-        return items
+    after = None
+    fetched = 0
 
-    for post in posts:
-        post_item = _item_from_post(post)
-        if post_item and post_item["id"] not in processed_ids:
-            items.append(post_item)
+    while fetched < post_limit:
+        batch = min(100, post_limit - fetched)
+        url = f"https://www.reddit.com/r/{subreddit_name}/new.json?limit={batch}"
+        if after:
+            url += f"&after={after}"
 
-        # Fetch all comments for this post
-        try:
-            post.comments.replace_more(limit=0)  # flatten MoreComments objects
-            for comment in post.comments.list():
-                c_item = _item_from_comment(comment, post.title)
-                if c_item and c_item["id"] not in processed_ids:
-                    items.append(c_item)
-        except prawcore.exceptions.RequestException as e:
-            print(f"  [WARN] Could not fetch comments for {post.id}: {e}")
-            continue
+        data = _fetch_json(url)
+        if not data:
+            break
 
-    return items
+        posts = data.get("data", {}).get("children", [])
+        if not posts:
+            break
 
+        for post in posts:
+            post_item = _item_from_post(post, subreddit_name)
+            if post_item and post_item["id"] not in processed_ids:
+                items.append(post_item)
 
-def fetch_inbox_dms(
-    reddit: praw.Reddit,
-    processed_ids: set,
-    limit: int = 100,
-) -> list[dict]:
-    """
-    Fetches private messages (DMs) from the authenticated account's inbox.
-    Requires REDDIT_USERNAME and REDDIT_PASSWORD to be set in .env.
-    Returns items with type="dm".
-    """
-    items = []
-    try:
-        for message in reddit.inbox.messages(limit=limit):
-            item_id = f"dm_{message.id}"
-            if item_id in processed_ids:
-                continue
-            if message.author is None:
-                continue
-            items.append({
-                "id": item_id,
-                "type": "dm",
-                "username": str(message.author),
-                "subreddit": "DM",
-                "post_title": message.subject or "(no subject)",
-                "content": message.body[:2000],
-                "url": f"https://www.reddit.com/message/messages/{message.id}",
-                "timestamp": datetime.fromtimestamp(message.created_utc, tz=timezone.utc).isoformat(),
-                "parent_title": None,
-            })
-    except prawcore.exceptions.OAuthException:
-        print("  [WARN] Cannot read inbox: REDDIT_USERNAME/REDDIT_PASSWORD not set or invalid.")
-    except prawcore.exceptions.RequestException as e:
-        print(f"  [WARN] Could not fetch inbox DMs: {e}")
+            # Fetch comments for this post
+            post_id = post.get("data", {}).get("id")
+            permalink = post.get("data", {}).get("permalink")
+            post_title = post.get("data", {}).get("title", "")
+
+            if post_id and permalink:
+                comments_url = f"https://www.reddit.com{permalink}.json?limit=500"
+                comments_data = _fetch_json(comments_url)
+                if comments_data and len(comments_data) > 1:
+                    comment_children = comments_data[1].get("data", {}).get("children", [])
+                    for c_item in _extract_comments(comment_children, post_title, subreddit_name):
+                        if c_item["id"] not in processed_ids:
+                            items.append(c_item)
+                time.sleep(0.5)  # be polite between comment fetches
+
+        after = data.get("data", {}).get("after")
+        fetched += len(posts)
+        if not after:
+            break
 
     return items
 
 
 def collect_all_items(
-    reddit: praw.Reddit,
     subreddits: list[str],
     processed_ids: set,
     post_limit: int = 50,
@@ -145,22 +140,13 @@ def collect_all_items(
 
     for subreddit_name in subreddits:
         print(f"  Fetching r/{subreddit_name}...")
-        items = fetch_subreddit_items(reddit, subreddit_name, post_limit, processed_ids)
+        items = fetch_subreddit_items(subreddit_name, post_limit, processed_ids)
         for item in items:
             if item["id"] not in seen_ids:
                 seen_ids.add(item["id"])
                 all_items.append(item)
         print(f"  -> {len(items)} new items from r/{subreddit_name}")
-        time.sleep(1)
-
-    # Fetch inbox DMs (requires REDDIT_USERNAME + REDDIT_PASSWORD in .env)
-    print("  Fetching inbox DMs...")
-    dm_items = fetch_inbox_dms(reddit, processed_ids)
-    for item in dm_items:
-        if item["id"] not in seen_ids:
-            seen_ids.add(item["id"])
-            all_items.append(item)
-    print(f"  -> {len(dm_items)} new DMs")
+        time.sleep(2)  # be polite between subreddit requests
 
     all_items.sort(key=lambda x: x["timestamp"], reverse=True)
     return all_items
