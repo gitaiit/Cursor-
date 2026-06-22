@@ -7,7 +7,7 @@ import requests
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; admit_co_bot/1.0)"}
 
 
-def _fetch_json(url: str, retries: int = 3) -> dict | None:
+def _fetch_json(url: str, retries: int = 3):
     for attempt in range(retries):
         try:
             response = requests.get(url, headers=HEADERS, timeout=10)
@@ -26,7 +26,7 @@ def _fetch_json(url: str, retries: int = 3) -> dict | None:
     return None
 
 
-def _item_from_post(post: dict, subreddit: str) -> dict | None:
+def _item_from_post(post: dict, subreddit: str):
     data = post.get("data", {})
     if data.get("selftext") in ("", "[removed]", "[deleted]") or not data.get("author"):
         return None
@@ -43,7 +43,7 @@ def _item_from_post(post: dict, subreddit: str) -> dict | None:
     }
 
 
-def _item_from_comment(comment: dict, post_title: str, subreddit: str) -> dict | None:
+def _item_from_comment(comment: dict, post_title: str, subreddit: str):
     data = comment.get("data", {})
     if data.get("body") in ("[removed]", "[deleted]") or not data.get("author"):
         return None
